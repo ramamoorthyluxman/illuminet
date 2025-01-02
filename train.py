@@ -20,35 +20,76 @@ import matplotlib.pyplot as plt
 
 from utils import params
 
-class PixelwiseMLPRelight(nn.Module):
-    def __init__(self, input_dim=2, hidden_dim=8):
+class TruePixelwiseMLPRelight(nn.Module):
+    def __init__(self, input_dim=2, hidden_dims=[8, 8, 8], patch_size=8):
         super().__init__()
-        # Single shared network architecture, will be applied to each pixel
-        self.pixel_weights1 = nn.Parameter(torch.randn(1024, 1024, hidden_dim, input_dim) * 0.01)
-        self.pixel_bias1 = nn.Parameter(torch.zeros(1024, 1024, hidden_dim))
-        # Modified second layer to output 3 channels
-        self.pixel_weights2 = nn.Parameter(torch.randn(1024, 1024, 3, hidden_dim) * 0.01)
-        self.pixel_bias2 = nn.Parameter(torch.zeros(1024, 1024, 3))
+        
+        # Calculate number of patches
+        self.patch_size = patch_size
+        self.num_patches_h = 1024 // patch_size  # Should be 128 for patch_size=8
+        self.num_patches_w = 1024 // patch_size  # Should be 128 for patch_size=8
+        
+        print(f"Number of patches: {self.num_patches_h}x{self.num_patches_w}")
+        
+        # For each patch, create a set of weights (sharing within patch)
+        # Layer 1: input_dim -> hidden_dims[0]
+        self.weights1 = nn.Parameter(torch.randn(self.num_patches_h, self.num_patches_w, 
+                                               hidden_dims[0], input_dim) * 0.01)
+        self.bias1 = nn.Parameter(torch.zeros(self.num_patches_h, self.num_patches_w, 
+                                            hidden_dims[0]))
+        
+        # Hidden layers
+        self.weights2 = nn.Parameter(torch.randn(self.num_patches_h, self.num_patches_w, 
+                                               hidden_dims[1], hidden_dims[0]) * 0.01)
+        self.bias2 = nn.Parameter(torch.zeros(self.num_patches_h, self.num_patches_w, 
+                                            hidden_dims[1]))
+        
+        self.weights3 = nn.Parameter(torch.randn(self.num_patches_h, self.num_patches_w, 
+                                               hidden_dims[2], hidden_dims[1]) * 0.01)
+        self.bias3 = nn.Parameter(torch.zeros(self.num_patches_h, self.num_patches_w, 
+                                            hidden_dims[2]))
+        
+        # Output layer: hidden_dims[-1] -> 3 (RGB)
+        self.weights_out = nn.Parameter(torch.randn(self.num_patches_h, self.num_patches_w, 
+                                                  3, hidden_dims[-1]) * 0.01)
+        self.bias_out = nn.Parameter(torch.zeros(self.num_patches_h, self.num_patches_w, 3))
 
     def forward(self, light_direction):
-        # light_direction shape: [batch_size, 2] (azimuth, elevation)
         batch_size = light_direction.shape[0]
         
-        # Expand input for parallel processing of all pixels
-        x = light_direction.unsqueeze(1).unsqueeze(1).expand(-1, 1024, 1024, -1)
+        # Expand light direction for patches
+        # [batch_size, 2] -> [batch_size, num_patches_h, num_patches_w, 2]
+        x = light_direction.unsqueeze(1).unsqueeze(1).expand(
+            -1, self.num_patches_h, self.num_patches_w, -1)
         
-        # First layer
-        hidden = torch.matmul(x.unsqueeze(-2), self.pixel_weights1.transpose(-1, -2))
-        hidden = hidden.squeeze(-2) + self.pixel_bias1
-        hidden = torch.relu(hidden)
+        # Layer 1
+        hidden = torch.sum(x.unsqueeze(-2) * self.weights1, dim=-1) + self.bias1
+        hidden = F.relu(hidden)
         
-        # Second layer
-        output = torch.matmul(hidden.unsqueeze(-2), self.pixel_weights2.transpose(-1, -2))
-        output = output.squeeze(-2) + self.pixel_bias2
-        output = torch.sigmoid(output)
+        # Layer 2
+        hidden = torch.sum(hidden.unsqueeze(-2) * self.weights2, dim=-1) + self.bias2
+        hidden = F.relu(hidden)
+        
+        # Layer 3
+        hidden = torch.sum(hidden.unsqueeze(-2) * self.weights3, dim=-1) + self.bias3
+        hidden = F.relu(hidden)
+        
+        # Output layer
+        output = torch.sum(hidden.unsqueeze(-2) * self.weights_out, dim=-1) + self.bias_out
+        output = torch.sigmoid(output)  # [batch_size, 128, 128, 3]
+        
+        # Reshape output to match image size by repeating patch values
+        # First, reshape to [batch_size, 128, 1, 128, 1, 3]
+        output = output.unsqueeze(2).unsqueeze(4)
+        
+        # Repeat patch values
+        output = output.repeat(1, 1, self.patch_size, 1, self.patch_size, 1)
+        
+        # Finally, reshape to image size [batch_size, 1024, 1024, 3]
+        output = output.reshape(batch_size, 1024, 1024, 3)
         
         return output
-
+    
 class PixelwiseDataset(Dataset):
     def __init__(self, light_directions, target_images):
         """
@@ -133,15 +174,16 @@ def train(light_directions, target_images):
     train_dataset = PixelwiseDataset(train_light_dirs, train_targets)
     val_dataset = PixelwiseDataset(val_light_dirs, val_targets)
     
-    # Verify data range after dataset creation
-    train_batch = next(iter(DataLoader(train_dataset, batch_size=1)))
-    print(f"Training batch range: min={train_batch['target_image'].min()}, max={train_batch['target_image'].max()}")
-    
     train_loader = DataLoader(train_dataset, batch_size=params.BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=params.BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
-    # Initialize model
-    model = PixelwiseMLPRelight()
+    # Initialize model with smaller network and patch-based approach
+    model = TruePixelwiseMLPRelight(
+        input_dim=2,
+        hidden_dims=[8, 8, 8],  # Much smaller network
+        patch_size=8  # Share weights within 8x8 patches
+    )
+    
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs!")
         model = nn.DataParallel(model)
@@ -149,11 +191,17 @@ def train(light_directions, target_images):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=params.LEARNING_RATE)
+    
+    # Use AdamW with weight decay for regularization
+    optimizer = optim.AdamW(model.parameters(), lr=params.LEARNING_RATE, weight_decay=0.01)
+    
+    # Add learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, 
+                                                   patience=5, verbose=True)
 
     # Training loop
     best_val_loss = float('inf')
-    patience = 10
+    patience = 15  # Increased patience
     patience_counter = 0
     train_losses = []
     val_losses = []
@@ -170,11 +218,13 @@ def train(light_directions, target_images):
             outputs = model(light_directions)
             loss = criterion(outputs, target_images)
             loss.backward()
-            optimizer.step()
             
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
             train_loss += loss.item()
             
-            # Print stats for first batch of each epoch
             if batch_idx == 0:
                 print(f"\nBatch Stats (Epoch {epoch+1}):")
                 print(f"Target range: min={target_images.min().item():.4f}, max={target_images.max().item():.4f}")
@@ -198,6 +248,9 @@ def train(light_directions, target_images):
         
         val_loss /= len(val_loader)
         val_losses.append(val_loss)
+        
+        # Update learning rate based on validation loss
+        scheduler.step(val_loss)
         
         print(f"Epoch {epoch+1}/{params.RTI_NET_EPOCHS}")
         print(f"Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
